@@ -30,7 +30,6 @@ load_game_dll(void)
 {
     GameDLL dll = {0};
 
-    // Copy so we can overwrite game.dylib during a rebuild without issues
     system("cp " GAME_DLL_PATH " " GAME_DLL_TMP_PATH);
 
     dll.handle = dlopen(GAME_DLL_TMP_PATH, RTLD_NOW | RTLD_LOCAL);
@@ -55,7 +54,7 @@ static void
 unload_game_dll(GameDLL *dll)
 {
     if (dll->handle) dlclose(dll->handle);
-    dll->handle = NULL;
+    dll->handle           = NULL;
     dll->update_and_render = NULL;
 }
 
@@ -70,10 +69,10 @@ main(void)
 
     u32 *pixels = malloc(WIDTH * HEIGHT * sizeof(u32));
 
-    GameState *state = calloc(1, GAME_STATE_MAX_SIZE);
-    state->pixels = pixels;
-    state->width  = WIDTH;
-    state->height = HEIGHT;
+    GameMemory memory = {
+        .permanent_storage_size = PERMANENT_STORAGE_SIZE,
+        .permanent_storage      = calloc(1, PERMANENT_STORAGE_SIZE),
+    };
 
     Image img = {
         .data    = pixels,
@@ -91,7 +90,6 @@ main(void)
     double last_time = GetTime();
 
     while (!WindowShouldClose()) {
-        // Hot reload when game.dylib changes on disk
         time_t mtime = file_mtime(GAME_DLL_PATH);
         if (mtime && mtime != game.mtime) {
             unload_game_dll(&game);
@@ -101,20 +99,25 @@ main(void)
         double now = GetTime();
 
         GameInput input = {
-            .left        = IsKeyDown(KEY_LEFT)  || IsKeyDown(KEY_A),
-            .right       = IsKeyDown(KEY_RIGHT) || IsKeyDown(KEY_D),
-            .up          = IsKeyDown(KEY_UP)    || IsKeyDown(KEY_W),
-            .down        = IsKeyDown(KEY_DOWN)  || IsKeyDown(KEY_S),
-            .bullet_shot = IsKeyDown(KEY_SPACE),
+            .left         = IsKeyDown(KEY_LEFT)  || IsKeyDown(KEY_A),
+            .right        = IsKeyDown(KEY_RIGHT) || IsKeyDown(KEY_D),
+            .up           = IsKeyDown(KEY_UP)    || IsKeyDown(KEY_W),
+            .down         = IsKeyDown(KEY_DOWN)  || IsKeyDown(KEY_S),
+            .bullet_shot  = IsKeyDown(KEY_SPACE),
             .current_time = now,
             .dt           = now - last_time,
         };
         last_time = now;
 
+        RenderBuffer render = {
+            .pixels = pixels,
+            .width  = WIDTH,
+            .height = HEIGHT,
+        };
+
         GameAudio audio = {0};
 
-        if (game.update_and_render)
-            game.update_and_render(state, &input, &audio);
+        if (game.update_and_render) game.update_and_render(&memory, &input, &audio, &render);
 
         if (audio.play_hit_sound) PlaySound(hit_sound);
 
@@ -134,7 +137,7 @@ main(void)
     CloseAudioDevice();
     CloseWindow();
     free(pixels);
-    free(state);
+    free(memory.permanent_storage);
 
     return 0;
 }

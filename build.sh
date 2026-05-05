@@ -3,17 +3,13 @@ set -e
 
 mkdir -p build
 
-TARGET=${1:-all}
+FLAGS="-I/opt/homebrew/include -Wall -Wno-deprecated-declarations -g -O0"
 
-if [ "$TARGET" = "game" ] || [ "$TARGET" = "all" ]; then
-    clang -dynamiclib -o build/game.dylib game.c \
-        -I/opt/homebrew/include \
-        -Wall -Wno-deprecated-declarations
-fi
+build_game()     { clang -dynamiclib -o build/game.dylib game.c $FLAGS; }
+build_platform() { clang -o build/asteroids platform.c $FLAGS -L/opt/homebrew/lib -lraylib; }
 
-if [ "$TARGET" = "platform" ] || [ "$TARGET" = "all" ]; then
-    clang -o build/asteroids platform.c \
-        -I/opt/homebrew/include \
-        -L/opt/homebrew/lib -lraylib \
-        -Wall -Wno-deprecated-declarations
-fi
+case "${1:-all}" in
+    game) build_game ;;
+    all)  build_game && build_platform ;;
+    *)    echo "Usage: $0 [game|all]"; exit 1 ;;
+esac
