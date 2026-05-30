@@ -8,6 +8,7 @@
 
 #include "base.h"
 #include "game.h"
+#include "arena.c"
 
 #define GAME_DLL_PATH     "build/game.dylib"
 #define GAME_DLL_TMP_PATH "build/game_tmp.dylib"
