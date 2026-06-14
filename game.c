@@ -6,11 +6,14 @@
 #include <math.h>
 #include <pthread.h>
 #include <curl/curl.h>
+#include <stdatomic.h>
 
 #include "base.h"
 #define STB_TRUETYPE_IMPLEMENTATION
 #include "stb_truetype.h"
+
 #include "game.h"
+#include "arena.c"
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -32,6 +35,8 @@
 #define COLOR_WHITE 0xFFFFFFFF
 #define COLOR_GREEN 0xFF00FF00
 #define COLOR_RED   0xFF0000FF
+
+#define TEXTBOX_HEIGHT 100
 
 
 // ── Private types ─────────────────────────────────────────────────────────────
@@ -63,7 +68,8 @@ typedef struct {
 } AsteroidPool;
 
 typedef struct {
-    size_t state_size;  // first field — detects layout changes on hot reload
+    // first field — detects layout changes on hot reload
+    size_t state_size;
 
     double last_time_hit;
     double last_time_message_changed;
@@ -87,143 +93,138 @@ typedef struct {
     u32 knowledge_base_size;
     u8 *knowledge_base;
     u8 *message;
+
+    // Data for sending request to and receive response from llm
+    CURL *curl;
+
+    // Assume for now that the response I receive from curl will never exceed 300 char
+    char  read_buffer[600];
+    u64   read_buffer_len;
+
+    char  llm_response[300];
+    char *player_prompt;
+
+    atomic_bool thread_running;
+    pthread_mutex_t llm_response_mutex;
 } GameState;
 
-char npc_response[2048] = "Press [E] to speak to the wizard...";
-
-// Struct to help libcurl store the response data dynamically
-struct MemoryStruct {
-    char *memory;
-    size_t size;
-};
-
 // Callback function for libcurl to write incoming data chunks
-static size_t WriteMemoryCallback(void *contents, size_t size, size_t nmemb, void *userp) {
-    size_t realsize = size * nmemb;
-    struct MemoryStruct *mem = (struct MemoryStruct *)userp;
+size_t
+WriteCallback(void *contents, size_t size, size_t nmemb, void *userp)
+{
+    size_t real_size = size * nmemb;
+    GameState *game_state = (GameState *)userp;
 
-    char *ptr = realloc(mem->memory, mem->size + realsize + 1);
-    if(!ptr) {
-        printf("not enough memory (realloc returned NULL)\n");
-        return 0;
-    }
+    u64 space = sizeof(game_state->read_buffer) - 1 - game_state->read_buffer_len;
 
-    mem->memory = ptr;
-    memcpy(&(mem->memory[mem->size]), contents, realsize);
-    mem->size += realsize;
-    mem->memory[mem->size] = 0;
+    // How many bytes can I actually copy without overflowing
+    size_t n = real_size < space ? real_size : space;
 
-    return realsize;
+    memcpy(game_state->read_buffer + game_state->read_buffer_len, contents, n);
+    game_state->read_buffer_len += n;
+    game_state->read_buffer[game_state->read_buffer_len] = 0;
+
+    // return the full amount so curl doesn't error
+    return real_size;   
 }
 
 // Simple quick-and-dirty helper to extract the "response" field from Ollama's JSON
 // For complex games, consider using a proper library like cJSON.
-void ExtractOllamaResponse(const char* json_str, char* dest, size_t dest_max) {
+
+// While the response is being writtin into llm_response I want no other thread (in this case the main one)
+// To access the resource, I think this is the place, but let's think about what would happen
+// If I put a mutex here will it block the main thread until it finishes the copy?
+void
+ExtractOllamaResponse(const char* json_str, char* llm_response, size_t dest_max)
+{
     const char* key = "\"response\":\"";
     const char* start = strstr(json_str, key);
 
-    
-    if (start) {
+    if (start)
+    {
         start += strlen(key);
         size_t i = 0;
         
         // Copy until the closing unescaped quote (ignoring simple \" for now)
-        while (*start && *start != '"' && i < dest_max - 1) {
+        while (*start && *start != '"' && i < dest_max - 1)
+        {
             // Handle simple escape characters if necessary
-            if (*start == '\\' && *(start + 1) == 'n') {
-                dest[i++] = '\n';
+            if (*start == '\\' && *(start + 1) == 'n')
+            {
+                llm_response[i++] = '\n';
                 start += 2;
-            } else {
-                dest[i++] = *start;
+            }
+            else
+            {
+                llm_response[i++] = *start;
                 start++;
             }
         }
-        dest[i] = '\0';
+        llm_response[i] = '\0';
     }
-    else {
-        snprintf(dest, dest_max, "Error: Could not parse response.");
+    else
+    {
+        snprintf(llm_response, dest_max, "Error: Could not parse response.");
     }
 }
 
 // The background worker function
-void* FetchLLMDialogue(void* arg)
+// A thread is created with pthread_create in game.c
+// So this function runs on the thread and performs a curl
+// In game_init you can see how the curl is set up, in particular the function that will be called
+// When something returns from the API call is WriteCallback
+// This function gets called when the curl request has something to return
+// The function will copy contents into the game_state->read_buffer
+// So this means that I want to keep reading stuff into the game_state->read_buffer and clear it only
+// When a new request is done so that a new message arrive
+
+// So this is what is happening on the thread, in the meantime what is happening on the main loop?
+// In the main loop we print state->llm_response on the screen (line 840 of game.c)
+// So when state->llm_response is actually written?
+// It is ExtractOllamaResponse that is responsible for taking what is stored in the read_buffer and
+// write the string into game_state->llm_response (after parsing of the json)
+// So this means that also ExtractOllamaResponse is running in the thread?
+// So I have game_state->llm_response that is updated in the thread and then is read in the game
+// main loop. Can this be a problem in terms of race condition?
+// Really study and analyze what is going on, it is the first time I am studying something thread
+// related and async call. I need an as much as possible in depth explanation on what is happening
+// and what problems might arise.
+
+// Current problems in the code caused by the fact that we are using a thread
+void *
+FetchLLMDialogue(void* _game_state)
 {
-    // TODO: instead of just passing the prompt.json, the payload must be enhanced using RAG
+    GameState *game_state = (GameState *)_game_state;
 
-    // GameState *game_state = (GameState *)arg;
-    // const char* player_prompt = (const char*)arg;
+    CURL *curl = game_state->curl;
 
-    CURL *curl_handle;
-    CURLcode res;
-    struct MemoryStruct chunk;
+    // The json that the post request return
+    char *read_buffer = game_state->read_buffer;
 
-    chunk.memory = malloc(1);  // Will be grown as needed by the realloc above
-    chunk.size = 0;    
-
-    curl_global_init(CURL_GLOBAL_ALL);
-    curl_handle = curl_easy_init();
-
-    if(curl_handle)
+    if (curl)
     {
-        curl_easy_setopt(curl_handle, CURLOPT_URL, "http://localhost:11434/api/generate");
+        // Reset to 0 the buffer len so that I can write the new response from the llm
+        game_state->read_buffer_len = 0;
 
-        char *payload = 0;
-        long length;
-        FILE *f = fopen("resources/prompt.json", "rb");
+        CURLcode res = curl_easy_perform(curl);
 
-        if (f)
+        pthread_mutex_lock(&game_state->llm_response_mutex);
+        if(res != CURLE_OK)
         {
-            fseek(f, 0, SEEK_END);
-            length = ftell(f);
-            fseek(f, 0, SEEK_SET);
-            payload = malloc(length);
-            if (payload)
-            {
-                fread(payload, 1, length, f);
-            }
-            fclose (f);
+            snprintf(game_state->llm_response, sizeof(game_state->llm_response),
+                     "CURL Error: %s", curl_easy_strerror(res));
         }
-
-        if (payload)
+        else
         {
-            struct curl_slist *headers = NULL;
-            headers = curl_slist_append(headers, "Content-Type: application/json");
-            curl_easy_setopt(curl_handle, CURLOPT_HTTPHEADER, headers);
-
-            // Set POST data
-            curl_easy_setopt(curl_handle, CURLOPT_POSTFIELDS, payload);
-
-            // Send all data to this function  
-            curl_easy_setopt(curl_handle, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
-
-            // Pass the 'chunk' struct to the callback function
-            curl_easy_setopt(curl_handle, CURLOPT_WRITEDATA, (void *)&chunk);
-
-            // Perform the request, res will get the return code
-            res = curl_easy_perform(curl_handle);
-
-            if(res != CURLE_OK)
-            {
-                snprintf(npc_response, sizeof(npc_response), "CURL Error: %s", curl_easy_strerror(res));
-            }
-            else
-            {
-                ExtractOllamaResponse(chunk.memory, npc_response, sizeof(npc_response));
-            }
-
-            // Cleanup curl handles and headers
-            curl_easy_cleanup(curl_handle);
-            curl_slist_free_all(headers);
+            ExtractOllamaResponse(read_buffer, game_state->llm_response, sizeof(game_state->llm_response));
         }
-
-        free(payload);
+        pthread_mutex_unlock(&game_state->llm_response_mutex);
     }
 
-    // Free the dynamic memory chunk
-    free(chunk.memory);
-    curl_global_cleanup();
-    
-    // Unlock the generator state so the player can press 'E' again
+    // Release the flag last, after llm_response is fully written, so the main
+    // thread can spawn the next request. This store also becomes the
+    // synchronization point we will lean on when we fix the llm_response race.
+    atomic_store(&game_state->thread_running, false);
     return NULL;
 }
 
@@ -232,9 +233,26 @@ void* FetchLLMDialogue(void* arg)
 static void
 set_pixel(RenderBuffer *render, int x, int y, u32 color)
 {
-    int sx = (x + render->width)  % render->width;
-    int sy = (y + render->height) % render->height;
-    render->pixels[render->width * sy + sx] = color;
+    // Wrap (toroidal) into the view's own bounds.
+    int sx = x % render->width;
+    if (sx < 0) sx += render->width;
+    int sy = y % render->height;
+    if (sy < 0) sy += render->height;
+
+    render->pixels[render->stride * sy + sx] = color;
+}
+
+// A view into a sub-rectangle of `parent`. Shares the parent's memory and
+// stride; drawing wraps within [0,width) x [0,height) of the sub-region.
+static RenderBuffer
+sub_buffer(RenderBuffer *parent, int x, int y, int width, int height)
+{
+    return (RenderBuffer){
+        .pixels = parent->pixels + (y * parent->stride + x),
+        .width  = width,
+        .height = height,
+        .stride = parent->stride,
+    };
 }
 
 static void
@@ -255,7 +273,8 @@ draw_line_high(RenderBuffer *render, int x0, int y0, int x1, int y1, u32 color)
 }
 
 static void
-draw_line_low(RenderBuffer *render, int x0, int y0, int x1, int y1, u32 color)
+draw_line_low(RenderBuffer *render, int x0, int y0, int x1, int y1,
+              u32 color)
 {
     int dx = x1 - x0, dy = y1 - y0, vstep = 1;
     if (dy < 0) { dy = -dy; vstep = -1; }
@@ -272,7 +291,9 @@ draw_line_low(RenderBuffer *render, int x0, int y0, int x1, int y1, u32 color)
 }
 
 static void
-draw_line(RenderBuffer *render, int x0, int y0, int x1, int y1, u32 color)
+draw_line(RenderBuffer *render,
+          int x0, int y0, int x1, int y1,
+          u32 color)
 {
     if (abs(y1 - y0) < abs(x1 - x0)) {
         if (x0 > x1)
@@ -298,6 +319,18 @@ draw_ship_at(RenderBuffer *render, int x_center, int y_center, float rotation, u
     draw_line(render, x0, y0, x1, y1, color);
     draw_line(render, x1, y1, x2, y2, color);
     draw_line(render, x2, y2, x0, y0, color);
+}
+
+static void
+draw_rectangle(RenderBuffer *render, int x, int y, int width, int height, u32 color)
+{
+    // Horizontal lines
+    draw_line(render, x, y, x + width, y, color);
+    draw_line(render, x, y + height, x + width, y + height, color);
+
+    // Vertical lines
+    draw_line(render, x, y, x, y + height, color);
+    draw_line(render, x + width, y, x + width, y + height, color);
 }
 
 static int
@@ -364,8 +397,7 @@ draw_message(GameState      *state,
     int y_baseline = y + (int)(ascent * scale);
     for (int i = 0; text[i]; i++) {
         int w, h, xoff, yoff;
-        unsigned char *bitmap = stbtt_GetCodepointBitmap(font, scale, scale, text[i],
-                                                         &w, &h, &xoff, &yoff);
+        unsigned char *bitmap = stbtt_GetCodepointBitmap(font, scale, scale, text[i], &w, &h, &xoff, &yoff);
         for (int row = 0; row < h; row++) {
             for (int col = 0; col < w; col++) {
                 unsigned char alpha = bitmap[row * w + col];
@@ -374,7 +406,7 @@ draw_message(GameState      *state,
                 int py = y_baseline + yoff + row;
                 if (px >= 0 && px < render->width && py >= 0 && py < render->height) {
                     u32 v = alpha;
-                    render->pixels[render->width * py + px] = 0xFF000000 | (v << 16) | (v << 8) | v;
+                    render->pixels[render->stride * py + px] = 0xFF000000 | (v << 16) | (v << 8) | v;
                 }
             }
         }
@@ -495,20 +527,43 @@ create_asteroids_at_startup(GameState *state, RenderBuffer *render)
 }
 
 static void
-game_init(GameState *state, RenderBuffer *render, double current_time)
+game_init(Arena *arena, GameState *state, RenderBuffer *render, double current_time)
 {
+    state->read_buffer_len = 0;
+
+    state->curl = curl_easy_init();
+    if(state->curl)
+    {
+        curl_easy_setopt(state->curl, CURLOPT_URL, "http://localhost:11434/api/generate");
+        curl_easy_setopt(state->curl, CURLOPT_POST, 1L);
+
+        // stream:false -> Ollama returns ONE JSON object with a single
+        // "response" field, which is what ExtractOllamaResponse expects.
+        curl_easy_setopt(state->curl, CURLOPT_POSTFIELDS, "{\"model\":\"gemma3:4b\",\"prompt\":\"Say whatever you want in 10 words.\",\"stream\":false}");
+
+        struct curl_slist *headers = curl_slist_append(NULL, "Content-Type: application/json");
+        curl_easy_setopt(state->curl, CURLOPT_HTTPHEADER, headers);
+
+        curl_easy_setopt(state->curl, CURLOPT_WRITEFUNCTION, WriteCallback);
+        curl_easy_setopt(state->curl, CURLOPT_WRITEDATA, state);
+    }
+
     state->x_center                  = render->width  / 2;
     state->y_center                  = render->height / 2;
     state->last_time_hit             = current_time - INVISIBILITY_TIME;
     state->last_time_message_changed = current_time - MESSAGE_TIME;
-    state->ship_color                = COLOR_WHITE;
+    state->ship_color                = COLOR_RED;
+    state->state_size                = sizeof(GameState);
+
+    state->thread_running = false;
+    pthread_mutex_init(&state->llm_response_mutex, NULL);
 
     FILE *f = fopen("resources/PressStart2P-Regular.ttf", "rb");
     if (f) {
         fseek(f, 0, SEEK_END);
         long size = ftell(f);
         fseek(f, 0, SEEK_SET);
-        state->font_buffer = malloc(size);
+        state->font_buffer = array_push(arena, u8, size);
         fread(state->font_buffer, 1, size, f);
         fclose(f);
         stbtt_InitFont(&state->font, state->font_buffer, 0);
@@ -519,7 +574,7 @@ game_init(GameState *state, RenderBuffer *render, double current_time)
         fseek(f2, 0, SEEK_END);
         long size = ftell(f2);
         fseek(f2, 0, SEEK_SET);
-        state->font_buffer_comic_sans = malloc(size);
+        state->font_buffer_comic_sans = array_push(arena, u8, size);
         fread(state->font_buffer_comic_sans, 1, size, f2);
         fclose(f2);
         stbtt_InitFont(&state->font_comic_sans, state->font_buffer_comic_sans, 0);
@@ -531,13 +586,13 @@ game_init(GameState *state, RenderBuffer *render, double current_time)
         fseek(f_kb, 0, SEEK_END);
         long size = ftell(f2);
         fseek(f_kb, 0, SEEK_SET);
-        state->knowledge_base      = malloc(size);
+        state->knowledge_base      = array_push(arena, u8, size);
         state->knowledge_base_size = (u32)size;
         fread(state->knowledge_base, 1, size, f_kb);
         fclose(f_kb);
     }
 
-    state->message = malloc(100);
+    state->message = array_push(arena, u8, 100);
 
     init_asteroids(state);
     init_bullets(state);
@@ -715,7 +770,7 @@ check_invisibility(GameState *state, double current_time)
     if (delta < INVISIBILITY_TIME)
         state->ship_color = ((int)(4 * delta) % 2 == 0) ? COLOR_GREEN : COLOR_RED;
     else
-        state->ship_color = COLOR_WHITE;
+        state->ship_color = COLOR_GREEN;
 }
 
 static void
@@ -724,7 +779,8 @@ draw_asteroids(GameState *state, RenderBuffer *render)
     int idx = state->asteroid_pool.first_used;
     while (idx) {
         Asteroid *a  = &state->asteroid_pool.asteroids[idx];
-        int       x0 = a->x_vertices[0], y0 = a->y_vertices[0];
+        int x0 = a->x_vertices[0];
+        int y0 = a->y_vertices[0];
         for (int j = 1; j < ASTEROID_VERTICES + 1; ++j) {
             int x1 = a->x_vertices[j % ASTEROID_VERTICES];
             int y1 = a->y_vertices[j % ASTEROID_VERTICES];
@@ -749,144 +805,105 @@ draw_bullets(GameState *state, RenderBuffer *render)
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 void
-game_update_and_render(GameMemory *memory, GameInput *input, GameAudio *audio, RenderBuffer *render)
+game_update_and_render(GameMemory *game_memory, GameInput *input, GameAudio *audio, RenderBuffer *render)
 {
-    GameState *state = (GameState *)memory->permanent_storage;
+    RenderBuffer game_window = sub_buffer(render, 0, 0, render->width, render->height - TEXTBOX_HEIGHT);
+    RenderBuffer textbox_render = sub_buffer(render, 0, render->height - TEXTBOX_HEIGHT, render->width, TEXTBOX_HEIGHT);
 
-    // Detect layout changes from hot reload and reinitialize cleanly
-    if (state->state_size != sizeof(GameState)) {
-        memset(state, 0, sizeof(GameState));
-        state->state_size = sizeof(GameState);
+    arena_pop_to(game_memory->transient_memory, 0);
+
+    GameState *state = arena_start(game_memory->persistent_memory);
+
+    // Make sure that the GameState struct has not changed after hot reloading
+    if (game_memory->is_initialized) {
+        assert(state->state_size == sizeof(GameState));
+    } else {
+        state = array_push(game_memory->persistent_memory, GameState, 1);
+        game_memory->is_initialized = true;
     }
 
-    if (!state->x_center && !state->y_center) game_init(state, render, input->current_time);
+    if (!state->x_center && !state->y_center) game_init(game_memory->persistent_memory, state, &game_window, input->current_time);
 
     audio->play_hit_sound = false;
 
     double dt = input->dt;
 
     update_ship_velocity(state, input);
-    update_ship_position(state, render, dt);
+    update_ship_position(state, &game_window, dt);
     update_ship_rotation(state, dt);
 
     if (input->bullet_shot) shoot_bullet_from_ship(state);
 
-    update_asteroids_positions(state, render, dt);
+    update_asteroids_positions(state, &game_window, dt);
     update_bullets_positions(state, dt);
-    free_out_of_window_bullets(state, render);
+    free_out_of_window_bullets(state, &game_window);
 
     check_asteroid_ship_collision(state, input->current_time);
     if (state->hitted) {
         audio->play_hit_sound = true;
         state->last_time_hit  = input->current_time;
         state->hitted         = false;
-        state->x_center       = render->width  / 2;
-        state->y_center       = render->height / 2;
+        state->x_center       = game_window.width  / 2;
+        state->y_center       = game_window.height / 2;
     }
 
     check_invisibility(state, input->current_time);
     check_asteroid_bullet_collision(state);
 
+    // Clear the render buffer before drawing
     memset(render->pixels, 0, 4 * render->width * render->height);
 
-    draw_ship_at(render, state->x_center, state->y_center, state->rotation, state->ship_color);
-    draw_asteroids(state, render);
-    draw_bullets(state, render);
+    draw_ship_at(&game_window, state->x_center, state->y_center, state->rotation, state->ship_color);
+    draw_asteroids(state, &game_window);
+    draw_bullets(state, &game_window);
 
     char str_score[20];
     snprintf(str_score, sizeof(str_score), "%d", state->score);
     int w = measure_text(state->font, str_score, 30);
-    draw_message(state, state->font_buffer, &state->font,
-        render, str_score, render->width - w - 10, 10, 30);
+    draw_message(state, state->font_buffer, &state->font, &game_window, str_score, game_window.width - w - 10, 10, 30);
 
-    // TODO
-    // Draw the message near the ship
-    // Can I draw a simple square and fit the text inside it?
-    // That would mean to have some wrapping behavior for the text
+    // Move the creation of the thread in the platform layer
+    // Why? I think that the idea is that thread creation is a service that the platform layer offers to the
+    // game, similar to setting up memory, input, audio and renderer
 
-    // Now instead of this message I want a message that have to be written using RAG techiniques
-    // So let's prepare a text that will be read by the program at startup
-    // Now let's go with the RAG (that is not RAG)
-    // Let's have an LLM and pass the Diario entirely in the prompt
-    if (input->current_time - state->last_time_message_changed > MESSAGE_TIME) {
+    // So in the platform layer I must define how thread are spawned? That does not seem ideal
+    // Let's first think about the stuff I was worried about, which is handling correctly the
+    // thread concurrency problem, then I will handle the platform problems
+
+    // The function that the thread executes is FetchLLMDialogue
+    // this function have knowledge of GameState
+    // this is wrong, what if MESSAGE_TIME pass and FetchLLMDialogue is still running in the previous thread?
+    // I do not want to spawn another thread while the other is still running
+    // So I need a variable that can be set atomically to one variable from the thread 
+
+    // The second fix I have to make is related to the fact that while the child thread is writing stuff into
+    // the string the main thread can start reading from it
+
+    // Only fire a new request once MESSAGE_TIME has elapsed since the last one,
+    // AND only if no worker is currently running. The short-circuit matters:
+    // when the timer hasn't elapsed we never touch thread_running. When it has,
+    // atomic_exchange flips the flag to true and tells us whether a worker was
+    // already in flight (if so we skip and leave the flag set).
+    bool time_for_new_message = (input->current_time - state->last_time_message_changed) >= MESSAGE_TIME;
+
+    if (time_for_new_message && !atomic_exchange(&state->thread_running, true))
+    {
         // Spawn thread for receiving response asynchronously from llm server
-        const char* player_prompt = "How are you?";
-
-        // Considering that in FetchLLMDialogue I use WriteMemoryCallback
-        // Do I really need to spawn a thread?
-        // I was thinking of inlining FetchLLMDialogue here
-        // What would be the flow in that case?
-
         pthread_t thread_id;
-        pthread_create(&thread_id, NULL, FetchLLMDialogue, (void *)player_prompt);
+        pthread_create(&thread_id, NULL, FetchLLMDialogue, (void *)state);
         pthread_detach(thread_id);
 
         state->last_time_message_changed = input->current_time;
     }
 
-    // Look at npc_response and get its size in pixels
-    int llm_text_size = 20;
+    draw_rectangle(&textbox_render, 0, 0, textbox_render.width, textbox_render.height, COLOR_WHITE);
 
-    float llm_text_len_total = getStringWidth(&state->font_comic_sans, npc_response, (float)llm_text_size);
+    char response_copy[300];
+    pthread_mutex_lock(&state->llm_response_mutex);
+    memcpy(response_copy, state->llm_response, sizeof(response_copy));
+    pthread_mutex_unlock(&state->llm_response_mutex);
 
-    // I need to know the height in pixels of my font
-    // float scale = stbtt_ScaleForPixelHeight(&state->font_comic_sans, llm_text_size);
-    // int ascent;
-    // stbtt_GetFontVMetrics(&state->font_comic_sans, &ascent, NULL, NULL);
-
-    int llm_text_width  = llm_text_len_total;
-
-    char *ch = npc_response;
-    int npc_response_len = 0;
-    while (*ch != '\0')
-    {
-        ++npc_response_len;
-        ++ch;
-    }
-
-    // Let's divide npc response in 4 parts
-    char *npc_response_1 = malloc(100);
-    char *npc_response_2 = malloc(100);
-    char *npc_response_3 = malloc(100);
-    char *npc_response_4 = malloc(100);
-
-    strncpy(npc_response_1, npc_response,                            npc_response_len / 4);
-    strncpy(npc_response_2, npc_response +     npc_response_len / 4, npc_response_len / 4);
-    strncpy(npc_response_3, npc_response +     npc_response_len / 2, npc_response_len / 4);
-    strncpy(npc_response_4, npc_response + 3 * npc_response_len / 4, npc_response_len / 4);
-
-
-    // I want to draw a bounding box with proportion 4:1 around the text generated by the llm
-    int box_padding = 5;
-
-    // Horizontal lines
-    draw_line(render, state->x_center, state->y_center - box_padding,
-              state->x_center + llm_text_width / 4, state->y_center - box_padding, COLOR_WHITE);
-
-    draw_line(render, state->x_center, state->y_center + 4 * llm_text_size + box_padding,
-              state->x_center + llm_text_width / 4, state->y_center + 4 * llm_text_size + box_padding, COLOR_WHITE);
-
-    // Vertical lines
-    draw_line(render, state->x_center, state->y_center - box_padding,
-              state->x_center, state->y_center + 4 * llm_text_size + box_padding, COLOR_WHITE);
-
-    draw_line(render, state->x_center + llm_text_width / 4, state->y_center - box_padding,
-              state->x_center + llm_text_width / 4, state->y_center + 4 * llm_text_size + box_padding, COLOR_WHITE);
-
-    draw_message(state, state->font_buffer_comic_sans, &state->font_comic_sans,
-                 render, npc_response_1, state->x_center, state->y_center, llm_text_size);
-
-    draw_message(state, state->font_buffer_comic_sans, &state->font_comic_sans,
-                 render, npc_response_2, state->x_center, state->y_center + llm_text_size, llm_text_size);
-
-    draw_message(state, state->font_buffer_comic_sans, &state->font_comic_sans,
-                 render, npc_response_3, state->x_center, state->y_center + 2 * llm_text_size, llm_text_size);
-
-    draw_message(state, state->font_buffer_comic_sans, &state->font_comic_sans,
-                 render, npc_response_4, state->x_center, state->y_center + 3 * llm_text_size, llm_text_size);
-    
-    free(npc_response_1);
-    free(npc_response_2);
-    free(npc_response_3);
-    free(npc_response_4);
+    unsigned char *font = state->font_buffer_comic_sans;
+    stbtt_fontinfo *font_info = &state->font_comic_sans;
+    draw_message(state, font, font_info, &textbox_render, response_copy, 0, 0, 20);
 }

@@ -22,6 +22,14 @@ struct Arena {
 };
 _Static_assert(sizeof(Arena) <= ARENA_HEADER_SIZE, "ARENA_HEADER_SIZE is too small");
 
+typedef struct TCTX TCTX;
+struct TCTX {
+    Arena *scratch_arenas[2];
+};
+
+// Global
+__thread TCTX *tctx_thread_local;
+
 typedef struct Temp Temp;
 struct Temp
 {
@@ -29,15 +37,12 @@ struct Temp
   u64    pos;
 };
 
-// Globals scratch arenas
-Arena *scratch_arenas[2];
-
 Arena *arena_alloc(u64 capacity);
 void   arena_free(Arena *arena);
 
 u64 arena_global_position(Arena *arena);
 
-u8   *arena_push(Arena *arena, u64 size, u64 alignment);
+void *arena_push(Arena *arena, u64 size, u64 alignment);
 void  arena_pop_to(Arena *arena, u64 global_pos);
 
 Temp temp_begin(Arena *arena);
@@ -45,8 +50,14 @@ void temp_end(Temp temp);
 
 #define array_push(arena, type, count) arena_push(arena, sizeof(type) * count, AlignOf(type))
 
+// TCTX
+void  tctx_select(TCTX *tctx);
+void  tctx_release(TCTX *tctx);
+TCTX *tctx_selected(void);
+TCTX *tctx_alloc(void);
+
 // Scratch 
-void   scratch_alloc(void);
+// void   scratch_alloc(void);
 Arena *tctx_get_scratch(Arena **conflicts, u64 count);
 
 #define scratch_begin(conflicts, count) temp_begin(tctx_get_scratch(conflicts, count))

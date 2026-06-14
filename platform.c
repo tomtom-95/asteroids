@@ -55,7 +55,8 @@ static void
 unload_game_dll(GameDLL *dll)
 {
     if (dll->handle) dlclose(dll->handle);
-    dll->handle           = NULL;
+
+    dll->handle = NULL;
     dll->update_and_render = NULL;
 }
 
@@ -70,10 +71,14 @@ main(void)
 
     u32 *pixels = malloc(WIDTH * HEIGHT * sizeof(u32));
 
-    GameMemory memory = {
-        .permanent_storage_size = PERMANENT_STORAGE_SIZE,
-        .permanent_storage      = calloc(1, PERMANENT_STORAGE_SIZE),
+    RenderBuffer render = {
+        .pixels = pixels,
+        .width  = WIDTH,
+        .height = HEIGHT,
+        .stride = WIDTH,
     };
+
+    GameMemory game_memory = { false, arena_alloc(MB(100)), arena_alloc(MB(100)) };
 
     Image img = {
         .data    = pixels,
@@ -110,15 +115,9 @@ main(void)
         };
         last_time = now;
 
-        RenderBuffer render = {
-            .pixels = pixels,
-            .width  = WIDTH,
-            .height = HEIGHT,
-        };
-
         GameAudio audio = {0};
 
-        if (game.update_and_render) game.update_and_render(&memory, &input, &audio, &render);
+        if (game.update_and_render) game.update_and_render(&game_memory, &input, &audio, &render);
 
         if (audio.play_hit_sound) PlaySound(hit_sound);
 
@@ -138,7 +137,6 @@ main(void)
     CloseAudioDevice();
     CloseWindow();
     free(pixels);
-    free(memory.permanent_storage);
 
     return 0;
 }

@@ -1,5 +1,6 @@
 #include <stdlib.h>
 #include <stdbool.h>
+#include <assert.h>
 
 #include "arena.h"
 
@@ -30,14 +31,22 @@ arena_free(Arena *arena)
     }
 }
 
-u8 *
+void *
+arena_start(Arena *arena)
+{
+    return (u8 *)arena + ARENA_HEADER_SIZE;
+}
+
+void *
 arena_push(Arena *arena, u64 size, u64 alignment)
 {
+    assert(size < arena->capacity);
+
     Arena *curr = arena->curr;
 
     curr->pos = AlignPow2(curr->pos, alignment);
 
-    if (curr->pos + size > curr->capacity) {
+    if (curr->pos + size > ARENA_HEADER_SIZE + curr->capacity) {
         // Chain a new arena block
         Arena *next = malloc(ARENA_HEADER_SIZE + arena->capacity);
 
@@ -73,7 +82,11 @@ arena_pop_to(Arena *arena, u64 global_pos)
     }
 
     arena->curr = curr;
-    curr->pos   = global_pos - curr->base_pos;
+    if (global_pos == curr->base_pos) {
+        curr->pos = ARENA_HEADER_SIZE;
+    } else {
+        curr->pos = global_pos - curr->base_pos;
+    }
 }
 
 u64
@@ -97,25 +110,57 @@ temp_end(Temp temp)
     arena_pop_to(temp.arena, temp.pos);
 }
 
-void
-scratch_alloc(void)
+TCTX *
+tctx_alloc(void)
 {
-    scratch_arenas[0] = arena_alloc(KB(64));
-    scratch_arenas[1] = arena_alloc(KB(64));
+    Arena *arena_0 = arena_alloc(KB(64));
+    Arena *arena_1 = arena_alloc(KB(64));
+
+    TCTX *tctx = array_push(arena_0, TCTX, 1);
+    tctx->scratch_arenas[0] = arena_0;
+    tctx->scratch_arenas[1] = arena_1;
+
+    return tctx;
+}
+
+void
+tctx_release(TCTX *tctx)
+{
+    arena_free(tctx->scratch_arenas[0]);
+    arena_free(tctx->scratch_arenas[1]);
+}
+
+
+void
+tctx_select(TCTX *tctx)
+{
+    tctx_thread_local = tctx;
+}
+
+TCTX *
+tctx_selected(void)
+{
+    return tctx_thread_local;
 }
 
 Arena *
 tctx_get_scratch(Arena **conflicts, u64 count)
 {
-    for (u32 i = 0; i < ArraySize(scratch_arenas); ++i) {
+    TCTX *tctx = tctx_selected();
+
+    for (u32 i = 0; i < ArraySize(tctx->scratch_arenas); ++i)
+    {
         bool conflict = false;
-        for (u32 j = 0; j < count; ++j) {
-            if (scratch_arenas[i] == conflicts[j]) {
+        for (u32 j = 0; j < count; ++j)
+        {
+            if (tctx->scratch_arenas[i] == conflicts[j])
+            {
                 conflict = true;
             }
         }
-        if (!conflict) {
-            return scratch_arenas[i];
+        if (!conflict)
+        {
+            return tctx->scratch_arenas[i];
         }
     }
 
